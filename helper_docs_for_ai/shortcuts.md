@@ -1,7 +1,5 @@
 # LaserShowDesigner 快捷键指南
 
-本文档整理了项目中目前已经使用的所有快捷键，供 AI 助手和开发者参考。
-
 ## 主窗口快捷键 (Main Window)
 *定义位置：`src/ui/main_window.py`*
 

@@ -685,6 +685,91 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.dock_sources.toggleViewAction())
         view_menu.addAction(self.dock_props.toggleViewAction())
         
+        # Settings
+        settings_menu = menu.addMenu("设置")
+        settings_menu.addAction("模拟器设置...", self.open_simulator_settings)
+        
         # Help
         help_menu = menu.addMenu("帮助")
+        help_menu.addAction("快捷键", self.show_shortcuts_dialog)
         help_menu.addAction("关于")
+        
+    def open_simulator_settings(self):
+        from PySide6.QtWidgets import QDialog, QFormLayout, QDoubleSpinBox, QDialogButtonBox
+        
+        dlg = QDialog(self)
+        dlg.setWindowTitle("模拟器设置")
+        layout = QFormLayout(dlg)
+        
+        settings = QSettings("LaserShowDesigner", "Simulator")
+        default_x = settings.value("camera_default_x", 1316.0, type=float)
+        default_y = settings.value("camera_default_y", 50.0, type=float)
+        default_z = settings.value("camera_default_z", 1515.0, type=float)
+        
+        spin_x = QDoubleSpinBox()
+        spin_x.setRange(-10000, 10000)
+        spin_x.setValue(default_x)
+        layout.addRow("相机默认 X:", spin_x)
+        
+        spin_y = QDoubleSpinBox()
+        spin_y.setRange(-10000, 10000)
+        spin_y.setValue(default_y)
+        layout.addRow("相机默认 Y:", spin_y)
+        
+        spin_z = QDoubleSpinBox()
+        spin_z.setRange(-10000, 10000)
+        spin_z.setValue(default_z)
+        layout.addRow("相机默认 Z:", spin_z)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        layout.addRow(btn_box)
+        
+        if dlg.exec() == QDialog.Accepted:
+            settings.setValue("camera_default_x", spin_x.value())
+            settings.setValue("camera_default_y", spin_y.value())
+            settings.setValue("camera_default_z", spin_z.value())
+            
+            # Update current camera if user wants
+            reply = QMessageBox.question(self, "应用设置", "是否立即将当前模拟器相机重置为新默认位置？", 
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.simulator.camera_pos[0] = spin_x.value()
+                self.simulator.camera_pos[1] = spin_y.value()
+                self.simulator.camera_pos[2] = spin_z.value()
+
+    def show_shortcuts_dialog(self):
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton
+        import os
+        
+        dlg = QDialog(self)
+        dlg.setWindowTitle("快捷键列表")
+        dlg.resize(600, 400)
+        
+        layout = QVBoxLayout(dlg)
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        
+        # Try to read shortcuts.md
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        shortcuts_path = os.path.join(base_dir, "helper_docs_for_ai", "shortcuts.md")
+        
+        if os.path.exists(shortcuts_path):
+            with open(shortcuts_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                # Use Markdown support if available, otherwise fallback to plain text
+                try:
+                    text_edit.setMarkdown(content)
+                except AttributeError:
+                    text_edit.setPlainText(content)
+        else:
+            text_edit.setText("未找到快捷键文档。")
+            
+        layout.addWidget(text_edit)
+        
+        btn = QPushButton("确定")
+        btn.clicked.connect(dlg.accept)
+        layout.addWidget(btn)
+        
+        dlg.exec()

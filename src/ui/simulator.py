@@ -1,5 +1,5 @@
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtCore import Qt, QTimer, QPoint, Signal, QUrl
+from PySide6.QtCore import Qt, QTimer, QPoint, Signal, QUrl, QSettings
 from PySide6.QtGui import QMouseEvent, QWheelEvent, QKeyEvent, QPainter, QColor, QFont
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from OpenGL.GL import *
@@ -17,8 +17,14 @@ class SimulatorWidget(QOpenGLWidget):
         super().__init__(parent)
         self.setFocusPolicy(Qt.StrongFocus)
         
+        # Load Settings for Camera Default Position
+        settings = QSettings("LaserShowDesigner", "Simulator")
+        default_x = settings.value("camera_default_x", 1316.0, type=float)
+        default_y = settings.value("camera_default_y", 50.0, type=float)
+        default_z = settings.value("camera_default_z", 1515.0, type=float)
+        
         # State
-        self.camera_pos = np.array([1316.0, 50.0, 1515.0], dtype=np.float32)
+        self.camera_pos = np.array([default_x, default_y, default_z], dtype=np.float32)
         self.camera_lon = 0.0
         self.camera_lat = 0.0
         self.camera_fov = 70.0
@@ -995,7 +1001,7 @@ float oscillate(float minVal, float maxVal, float frequency, float time, float p
             self.meshes['box'].draw()
             glDepthMask(GL_TRUE)
             
-        # 3. Draw 2D Overlay (FPS)
+        # 3. Draw 2D Overlay (FPS & Camera Pos)
         glUseProgram(0)
         
         # FPS Calculation
@@ -1011,6 +1017,11 @@ float oscillate(float minVal, float maxVal, float frequency, float time, float p
         painter.setPen(QColor(255, 255, 255))
         painter.setFont(QFont("Arial", 10, QFont.Bold))
         painter.drawText(10, self.height() - 10, f"FPS: {self.fps:.1f}")
+        
+        # Camera Position (Top Left)
+        cam_text = f"X/Y/Z: {self.camera_pos[0]:.1f} / {self.camera_pos[1]:.1f} / {self.camera_pos[2]:.1f}"
+        painter.drawText(10, 20, cam_text)
+        
         painter.end()
 
     def load_audio(self, file_path):
