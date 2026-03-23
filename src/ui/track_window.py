@@ -355,15 +355,30 @@ class KeyframeItem(QGraphicsItem):
                                     item.setSelected(False)
                         except ValueError:
                             pass
+                    # Setup drag states for all selected
+                    self._update_all_drag_starts(scene)
                     return
                 elif modifiers & Qt.ControlModifier:
                     super().mousePressEvent(event)
                     for item in scene.selectedItems():
                         if isinstance(item, KeyframeItem) and getattr(item, 'track', None) != self.track:
                             item.setSelected(False)
+                    # Setup drag states for all selected
+                    self._update_all_drag_starts(scene)
                     return
 
         super().mousePressEvent(event)
+        
+        # In case it's a normal click but part of a multi-selection
+        if self.scene():
+            self._update_all_drag_starts(self.scene())
+            
+    def _update_all_drag_starts(self, scene):
+        selected_items = scene.selectedItems()
+        for item in selected_items:
+            if isinstance(item, KeyframeItem):
+                item.drag_start_time = item.keyframe.time
+                item.drag_start_val = item.keyframe.value
 
     def mouseReleaseEvent(self, event):
         # 阻止 Qt 默认在 Shift 松开时清空多选状态
@@ -379,19 +394,67 @@ class KeyframeItem(QGraphicsItem):
                 item.setSelected(True)
 
         if event.button() == Qt.LeftButton and hasattr(self, 'drag_start_time'):
-            new_time = self.keyframe.time
-            new_val = self.keyframe.value
+            # Fetch latest temp values (from itemChange), fallback to drag_start if not moved
+            new_time = getattr(self, 'temp_time', self.drag_start_time)
+            new_val = getattr(self, 'temp_val', self.drag_start_val)
+            
             if abs(new_time - self.drag_start_time) > 0.001 or abs(new_val - self.drag_start_val) > 0.001:
                 main_window = None
                 if self.scene() and hasattr(self.scene(), 'main_window'):
                     main_window = self.scene().main_window
-                if main_window:
-                    self.keyframe.time = self.drag_start_time
-                    self.keyframe.value = self.drag_start_val
-                    cmd = KeyframeMoveCommand(self.keyframe, self.drag_start_time, self.drag_start_val, new_time, new_val, "移动关键帧", main_window)
-                    main_window.undo_stack.push(cmd)
-            self.drag_start_time = self.keyframe.time
-            self.drag_start_val = self.keyframe.value
+                    
+                selected_items = self.scene().selectedItems() if self.scene() else []
+                keyframe_items = [item for item in selected_items if isinstance(item, KeyframeItem) and item.track == self.track]
+                
+                if len(keyframe_items) > 1 and self in keyframe_items:
+                    # Multi-drag logic
+                    if main_window:
+                        commands = []
+                        for item in keyframe_items:
+                            old_time = item.drag_start_time
+                            old_val = item.drag_start_val
+                            target_time = getattr(item, 'temp_time', old_time)
+                            target_val = getattr(item, 'temp_val', old_val)
+                            
+                            # Clean up temp state
+                            if hasattr(item, 'temp_time'): del item.temp_time
+                            if hasattr(item, 'temp_val'): del item.temp_val
+                            
+                            commands.append(KeyframeMoveCommand(item.keyframe, old_time, old_val, target_time, target_val, "移动关键帧", main_window))
+                            
+                        batch = BatchCommand(commands, "批量移动关键帧", main_window)
+                        main_window.undo_stack.push(batch)
+                        return # Objects might be deleted by refresh
+                else:
+                    # Single drag logic
+                    if main_window:
+                        target_time = getattr(self, 'temp_time', self.drag_start_time)
+                        target_val = getattr(self, 'temp_val', self.drag_start_val)
+                        
+                        if hasattr(self, 'temp_time'): del self.temp_time
+                        if hasattr(self, 'temp_val'): del self.temp_val
+                        
+                        cmd = KeyframeMoveCommand(self.keyframe, self.drag_start_time, self.drag_start_val, target_time, target_val, "移动关键帧", main_window)
+                        main_window.undo_stack.push(cmd)
+                        return # Objects might be deleted by refresh
+                        
+            # Update all selected items' drag_start states
+            try:
+                selected_items = self.scene().selectedItems() if self.scene() else []
+                keyframe_items = [item for item in selected_items if isinstance(item, KeyframeItem) and item.track == self.track]
+                if keyframe_items and self in keyframe_items:
+                    for item in keyframe_items:
+                        item.drag_start_time = item.keyframe.time
+                        item.drag_start_val = item.keyframe.value
+                        if hasattr(item, 'temp_time'): del item.temp_time
+                        if hasattr(item, 'temp_val'): del item.temp_val
+                else:
+                    self.drag_start_time = self.keyframe.time
+                    self.drag_start_val = self.keyframe.value
+                    if hasattr(self, 'temp_time'): del self.temp_time
+                    if hasattr(self, 'temp_val'): del self.temp_val
+            except RuntimeError:
+                pass
         
     def boundingRect(self):
         # Slightly larger rect for better hit testing
@@ -443,12 +506,17 @@ class KeyframeItem(QGraphicsItem):
         
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionChange and self.scene():
-            if hasattr(self.scene(), 'data_changed'):
-                self.scene().data_changed.emit()
             new_pos = value
             x = new_pos.x()
             y = new_pos.y()
             
+            # Check for Shift modifier to lock Y axis (maintain original parameter value)
+            shift_pressed = False
+            from PySide6.QtGui import QGuiApplication
+            modifiers = QGuiApplication.keyboardModifiers()
+            if modifiers & Qt.ShiftModifier:
+                shift_pressed = True
+
             # Snap Logic
             if hasattr(self.scene(), 'snap_granularity'):
                 snap_beats = self.scene().snap_granularity
@@ -456,50 +524,148 @@ class KeyframeItem(QGraphicsItem):
                 if snap_pixels > 1:
                     x = round(x / snap_pixels) * snap_pixels
 
-            # Constraints
-            if y < 0: y = 0
-            if y > self.track.height: y = self.track.height
+            # Calculate proposed deltas based on this item's movement
+            delta_x = x - (self.drag_start_time * self.pixels_per_beat) if hasattr(self, 'drag_start_time') else 0
             
-            # Time Constraints
-            try:
-                if self.keyframe in self.track.keyframes:
-                    idx = self.track.keyframes.index(self.keyframe)
-                    is_start = (idx == 0)
-                    is_end = (idx == len(self.track.keyframes) - 1)
+            # For Y, calculate value delta
+            normalized_y = (self.track.height - y) / self.track.height
+            r = self.track.max_val - self.track.min_val
+            
+            if shift_pressed:
+                # Lock Y to start value
+                proposed_val = self.drag_start_val if hasattr(self, 'drag_start_val') else self.keyframe.value
+                delta_val = 0
+            else:
+                proposed_val = self.track.min_val + (normalized_y * r)
+                delta_val = proposed_val - self.drag_start_val if hasattr(self, 'drag_start_val') else 0
+            
+            selected_items = self.scene().selectedItems()
+            keyframe_items = [item for item in selected_items if isinstance(item, KeyframeItem) and item.track == self.track]
+            
+            is_multi_drag = len(keyframe_items) > 1 and self in keyframe_items
+            
+            if is_multi_drag:
+                # Check constraints for ALL selected items before allowing the move
+                
+                # 1. Check if ANY selected item is Start/End anchor
+                has_edge_anchor = False
+                for item in keyframe_items:
+                    try:
+                        idx = self.track.keyframes.index(item.keyframe)
+                        if idx == 0 or idx == len(self.track.keyframes) - 1:
+                            has_edge_anchor = True
+                            break
+                    except ValueError:
+                        pass
+                
+                if has_edge_anchor:
+                    # Block horizontal movement entirely if start/end anchor is in selection
+                    delta_x = 0
+                    x = self.drag_start_time * self.pixels_per_beat if hasattr(self, 'drag_start_time') else x
+                else:
+                    # 2. Check time collision for all items
+                    # Ensure no item moves past its unselected neighbors
+                    for item in keyframe_items:
+                        try:
+                            idx = self.track.keyframes.index(item.keyframe)
+                            proposed_item_time = item.drag_start_time + (delta_x / self.pixels_per_beat)
+                            
+                            # Check left bound
+                            if idx > 0 and self.track.keyframes[idx-1] not in [it.keyframe for it in keyframe_items]:
+                                min_time = self.track.keyframes[idx-1].time + (1.0 / self.pixels_per_beat)
+                                if proposed_item_time < min_time:
+                                    delta_x = (min_time - item.drag_start_time) * self.pixels_per_beat
+                                    
+                            # Check right bound
+                            if idx < len(self.track.keyframes) - 1 and self.track.keyframes[idx+1] not in [it.keyframe for it in keyframe_items]:
+                                max_time = self.track.keyframes[idx+1].time - (1.0 / self.pixels_per_beat)
+                                if proposed_item_time > max_time:
+                                    delta_x = (max_time - item.drag_start_time) * self.pixels_per_beat
+                        except ValueError:
+                            pass
+                            
+                    x = (self.drag_start_time * self.pixels_per_beat) + delta_x if hasattr(self, 'drag_start_time') else x
+
+                # 3. Check value boundaries for all items (only if not shift_pressed)
+                if not shift_pressed:
+                    for item in keyframe_items:
+                        proposed_item_val = item.drag_start_val + delta_val
+                        if proposed_item_val > self.track.max_val:
+                            delta_val = self.track.max_val - item.drag_start_val
+                        elif proposed_item_val < self.track.min_val:
+                            delta_val = self.track.min_val - item.drag_start_val
+                            
+                proposed_val = self.drag_start_val + delta_val if hasattr(self, 'drag_start_val') else proposed_val
+                
+                # Recalculate Y based on constrained delta_val
+                normalized = (proposed_val - self.track.min_val) / r if r != 0 else 0
+                y = self.track.height - (normalized * self.track.height)
+                
+                # Apply VISUAL ONLY changes to ALL selected items (except self)
+                # Model changes are deferred to mouseReleaseEvent to prevent continuous full refreshes
+                for item in keyframe_items:
+                    if item != self:
+                        # Store temporary visual state
+                        item.temp_time = item.drag_start_time + (delta_x / self.pixels_per_beat)
+                        item.temp_val = item.drag_start_val + delta_val
+                        # Update their visual position without triggering itemChange recursion
+                        item_x = item.temp_time * self.pixels_per_beat
+                        item_norm = (item.temp_val - self.track.min_val) / r if r != 0 else 0
+                        item_y = self.track.height - (item_norm * self.track.height)
+                        # We use setPos safely because we don't update model here
+                        # We also temporarily disable itemChange for the children
+                        item.setFlag(QGraphicsItem.ItemSendsGeometryChanges, False)
+                        item.setPos(item_x, item_y)
+                        item.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+                            
+                # Update self visual state
+                self.temp_time = self.drag_start_time + (delta_x / self.pixels_per_beat) if hasattr(self, 'drag_start_time') else x / self.pixels_per_beat
+                self.temp_val = proposed_val
+                
+            else:
+                # Single Drag Logic (Original behavior, also made visual-only during drag)
+                if y < 0: y = 0
+                if y > self.track.height: y = self.track.height
+                
+                try:
+                    if self.keyframe in self.track.keyframes:
+                        idx = self.track.keyframes.index(self.keyframe)
+                        is_start = (idx == 0)
+                        is_end = (idx == len(self.track.keyframes) - 1)
+                        
+                        if is_start:
+                            x = 0 
+                        elif is_end:
+                            x = self.keyframe.time * self.pixels_per_beat
+                        else:
+                            prev_time = self.track.keyframes[idx-1].time
+                            next_time = self.track.keyframes[idx+1].time
+                            
+                            min_x = prev_time * self.pixels_per_beat + 1
+                            max_x = next_time * self.pixels_per_beat - 1
+                            
+                            if x < min_x: x = min_x
+                            if x > max_x: x = max_x
+                except ValueError:
+                    pass
                     
-                    if is_start:
-                        x = 0 
-                    elif is_end:
-                        # End anchor can be moved horizontally? 
-                        # User requirement: "Start and End anchor cannot be dragged horizontally"
-                        # But previous logic allowed it for end?
-                        # User: "开始锚点和结束锚点不可横向拖拽" -> Start/End Locked horizontally.
-                        # So x is fixed to current time.
-                        x = self.keyframe.time * self.pixels_per_beat
-                    else:
-                        prev_time = self.track.keyframes[idx-1].time
-                        next_time = self.track.keyframes[idx+1].time
-                        
-                        min_x = prev_time * self.pixels_per_beat + 1
-                        max_x = next_time * self.pixels_per_beat - 1
-                        
-                        if x < min_x: x = min_x
-                        if x > max_x: x = max_x
-            except ValueError:
-                pass
+                self.temp_time = x / self.pixels_per_beat
+                
+                if shift_pressed:
+                    self.temp_val = self.drag_start_val if hasattr(self, 'drag_start_val') else self.keyframe.value
+                    normalized = (self.temp_val - self.track.min_val) / r if r != 0 else 0
+                    y = self.track.height - (normalized * self.track.height)
+                else:
+                    normalized = (self.track.height - y) / self.track.height
+                    self.temp_val = self.track.min_val + (normalized * r)
 
             new_pos.setX(x)
             new_pos.setY(y)
             
-            # Update Model
-            self.keyframe.time = x / self.pixels_per_beat
-            
-            normalized = (self.track.height - y) / self.track.height
-            r = self.track.max_val - self.track.min_val
-            self.keyframe.value = self.track.min_val + (normalized * r)
-            
-            if self.parentItem() and hasattr(self.parentItem(), 'update_curve'):
-                 self.parentItem().update_curve()
+            # Note: We intentionally DO NOT update self.keyframe.time / self.keyframe.value here
+            # nor do we emit data_changed or update parent curve during drag
+            # to prevent expensive rebuilds and C++ object deletions.
+            # Only draw a simplified connection if needed, but standard Qt behavior leaves it visually okay.
                  
             return new_pos
             
@@ -602,6 +768,23 @@ class KeyframeItem(QGraphicsItem):
 
     def copy_value(self):
         QApplication.clipboard().setText(str(self.keyframe.value))
+        
+        # Sync with global Ctrl+C/Ctrl+V parameters
+        view = None
+        if self.scene() and self.scene().views():
+            view = self.scene().views()[0]
+        if view:
+            # Find TrackWindow (which is typically a parent or ancestor)
+            parent = view.parent()
+            while parent:
+                if type(parent).__name__ == 'TrackWindow' or hasattr(parent, 'paste_keyframe_params'):
+                    parent.copied_params = {
+                        'value': self.keyframe.value,
+                        'curve_type': self.keyframe.curve_type,
+                        'tension': self.keyframe.tension
+                    }
+                    break
+                parent = parent.parent()
         
     def paste_value(self):
         text = QApplication.clipboard().text()
@@ -2199,7 +2382,19 @@ class TrackWindow(QWidget):
             self.copied_params = None
 
     def paste_keyframe_params(self):
-        if not hasattr(self, 'copied_params') or self.copied_params is None:
+        params = getattr(self, 'copied_params', None)
+        
+        # Fallback to system clipboard if it contains a valid float number
+        if params is None:
+            from PySide6.QtGui import QApplication
+            text = QApplication.clipboard().text()
+            try:
+                val = float(text)
+                params = {'value': val, 'curve_type': None, 'tension': None}
+            except ValueError:
+                pass
+                
+        if params is None:
             return
             
         scene = self.timeline_scene
@@ -2215,12 +2410,17 @@ class TrackWindow(QWidget):
             commands = []
             for item in keyframe_items:
                 kf = item.keyframe
-                if kf.value != self.copied_params['value']:
-                    commands.append(PropertyChangeCommand(kf, "value", kf.value, self.copied_params['value'], "粘贴参数值", self.main_window))
-                if kf.curve_type != self.copied_params['curve_type']:
-                    commands.append(PropertyChangeCommand(kf, "curve_type", kf.curve_type, self.copied_params['curve_type'], "粘贴曲线类型", self.main_window))
-                if kf.tension != self.copied_params['tension']:
-                    commands.append(PropertyChangeCommand(kf, "tension", kf.tension, self.copied_params['tension'], "粘贴张力", self.main_window))
+                # Only apply value, and clamp it to track bounds
+                if params.get('value') is not None:
+                    clamped_val = max(item.track.min_val, min(item.track.max_val, params['value']))
+                    if kf.value != clamped_val:
+                        commands.append(PropertyChangeCommand(kf, "value", kf.value, clamped_val, "粘贴参数值", self.main_window))
+                
+                if params.get('curve_type') is not None and kf.curve_type != params['curve_type']:
+                    commands.append(PropertyChangeCommand(kf, "curve_type", kf.curve_type, params['curve_type'], "粘贴曲线类型", self.main_window))
+                
+                if params.get('tension') is not None and kf.tension != params['tension']:
+                    commands.append(PropertyChangeCommand(kf, "tension", kf.tension, params['tension'], "粘贴张力", self.main_window))
             
             if commands:
                 if len(commands) > 1:
@@ -2235,14 +2435,16 @@ class TrackWindow(QWidget):
             changed = False
             for item in keyframe_items:
                 kf = item.keyframe
-                if kf.value != self.copied_params['value']:
-                    kf.value = self.copied_params['value']
+                if params.get('value') is not None:
+                    clamped_val = max(item.track.min_val, min(item.track.max_val, params['value']))
+                    if kf.value != clamped_val:
+                        kf.value = clamped_val
+                        changed = True
+                if params.get('curve_type') is not None and kf.curve_type != params['curve_type']:
+                    kf.curve_type = params['curve_type']
                     changed = True
-                if kf.curve_type != self.copied_params['curve_type']:
-                    kf.curve_type = self.copied_params['curve_type']
-                    changed = True
-                if kf.tension != self.copied_params['tension']:
-                    kf.tension = self.copied_params['tension']
+                if params.get('tension') is not None and kf.tension != params['tension']:
+                    kf.tension = params['tension']
                     changed = True
                     
             if changed:
