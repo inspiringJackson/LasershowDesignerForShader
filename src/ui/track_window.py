@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QSize, QMimeData, QTimer, QEvent
 from PySide6.QtGui import (QPainter, QColor, QPen, QBrush, QWheelEvent, QMouseEvent, 
                            QPainterPath, QDragEnterEvent, QDropEvent, QIcon, QLinearGradient,
-                           QPolygonF)
+                           QPolygonF, QShortcut, QKeySequence)
 
 from core.models import Project, Track, Sequence, Keyframe, CurveType
 from core.commands import PropertyChangeCommand, AddItemCommand, RemoveItemCommand, ReplaceItemCommand, KeyframeMoveCommand, SequenceMoveCommand, SequenceResizeCommand, BatchCommand
@@ -327,10 +327,57 @@ class KeyframeItem(QGraphicsItem):
         if event.button() == Qt.LeftButton:
             self.drag_start_time = self.keyframe.time
             self.drag_start_val = self.keyframe.value
+            
+            scene = self.scene()
+            if scene:
+                modifiers = event.modifiers()
+                if modifiers & Qt.ShiftModifier:
+                    selected_items = scene.selectedItems()
+                    same_track_items = [item for item in selected_items if isinstance(item, KeyframeItem) and getattr(item, 'track', None) == self.track]
+                    
+                    super().mousePressEvent(event)
+                    
+                    if same_track_items:
+                        try:
+                            indices = [self.track.keyframes.index(item.keyframe) for item in same_track_items]
+                            my_idx = self.track.keyframes.index(self.keyframe)
+                            start_idx = min(min(indices), my_idx)
+                            end_idx = max(max(indices), my_idx)
+                            
+                            for item in scene.items():
+                                if isinstance(item, KeyframeItem) and getattr(item, 'track', None) == self.track:
+                                    idx = self.track.keyframes.index(item.keyframe)
+                                    if start_idx <= idx <= end_idx:
+                                        item.setSelected(True)
+                                        
+                            for item in scene.selectedItems():
+                                if isinstance(item, KeyframeItem) and getattr(item, 'track', None) != self.track:
+                                    item.setSelected(False)
+                        except ValueError:
+                            pass
+                    return
+                elif modifiers & Qt.ControlModifier:
+                    super().mousePressEvent(event)
+                    for item in scene.selectedItems():
+                        if isinstance(item, KeyframeItem) and getattr(item, 'track', None) != self.track:
+                            item.setSelected(False)
+                    return
+
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
+        # 阻止 Qt 默认在 Shift 松开时清空多选状态
+        saved_selection = None
+        if event.button() == Qt.LeftButton and event.modifiers() & Qt.ShiftModifier:
+            if self.scene():
+                saved_selection = self.scene().selectedItems()
+                
         super().mouseReleaseEvent(event)
+        
+        if saved_selection is not None:
+            for item in saved_selection:
+                item.setSelected(True)
+
         if event.button() == Qt.LeftButton and hasattr(self, 'drag_start_time'):
             new_time = self.keyframe.time
             new_val = self.keyframe.value
@@ -2110,6 +2157,13 @@ class TrackWindow(QWidget):
         self.audio_view.viewport().installEventFilter(self)
         self.header_scroll.viewport().installEventFilter(self)
         
+        # Setup copy/paste shortcuts
+        self.shortcut_copy = QShortcut(QKeySequence("Ctrl+C"), self)
+        self.shortcut_copy.activated.connect(self.copy_keyframe_params)
+        
+        self.shortcut_paste = QShortcut(QKeySequence("Ctrl+V"), self)
+        self.shortcut_paste.activated.connect(self.paste_keyframe_params)
+        
         self.refresh_tracks()
         
     def resizeEvent(self, event):
@@ -2126,6 +2180,74 @@ class TrackWindow(QWidget):
         self.ruler.offset_x = value
         self.ruler.update()
         self.audio_view.horizontalScrollBar().setValue(value)
+
+    def copy_keyframe_params(self):
+        scene = self.timeline_scene
+        if not scene: return
+        
+        selected_items = scene.selectedItems()
+        keyframe_items = [item for item in selected_items if isinstance(item, KeyframeItem)]
+        
+        if len(keyframe_items) == 1:
+            kf = keyframe_items[0].keyframe
+            self.copied_params = {
+                'value': kf.value,
+                'curve_type': kf.curve_type,
+                'tension': kf.tension
+            }
+        else:
+            self.copied_params = None
+
+    def paste_keyframe_params(self):
+        if not hasattr(self, 'copied_params') or self.copied_params is None:
+            return
+            
+        scene = self.timeline_scene
+        if not scene: return
+        
+        selected_items = scene.selectedItems()
+        keyframe_items = [item for item in selected_items if isinstance(item, KeyframeItem)]
+        
+        if not keyframe_items:
+            return
+            
+        if self.main_window:
+            commands = []
+            for item in keyframe_items:
+                kf = item.keyframe
+                if kf.value != self.copied_params['value']:
+                    commands.append(PropertyChangeCommand(kf, "value", kf.value, self.copied_params['value'], "粘贴参数值", self.main_window))
+                if kf.curve_type != self.copied_params['curve_type']:
+                    commands.append(PropertyChangeCommand(kf, "curve_type", kf.curve_type, self.copied_params['curve_type'], "粘贴曲线类型", self.main_window))
+                if kf.tension != self.copied_params['tension']:
+                    commands.append(PropertyChangeCommand(kf, "tension", kf.tension, self.copied_params['tension'], "粘贴张力", self.main_window))
+            
+            if commands:
+                if len(commands) > 1:
+                    batch = BatchCommand(commands, "粘贴锚点参数", self.main_window)
+                    self.main_window.undo_stack.push(batch)
+                else:
+                    self.main_window.undo_stack.push(commands[0])
+                
+                self.data_changed.emit()
+                self.refresh_tracks()
+        else:
+            changed = False
+            for item in keyframe_items:
+                kf = item.keyframe
+                if kf.value != self.copied_params['value']:
+                    kf.value = self.copied_params['value']
+                    changed = True
+                if kf.curve_type != self.copied_params['curve_type']:
+                    kf.curve_type = self.copied_params['curve_type']
+                    changed = True
+                if kf.tension != self.copied_params['tension']:
+                    kf.tension = self.copied_params['tension']
+                    changed = True
+                    
+            if changed:
+                self.data_changed.emit()
+                self.refresh_tracks()
 
     def on_splitter_moved(self, pos, index):
         self.corner_widget.setFixedWidth(pos)
