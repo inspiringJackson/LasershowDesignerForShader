@@ -50,7 +50,7 @@ class GLSLExporter:
             laser_tracks[laser.name] = []
             
         for track in self.project.tracks:
-            if track.target_laser not in laser_tracks:
+            if not track.enabled or track.target_laser not in laser_tracks:
                 continue
                 
             laser_idx = -1

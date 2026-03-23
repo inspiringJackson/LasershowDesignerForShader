@@ -16,6 +16,9 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QKeySequence, QShortcut
 
 from core.exporter import GLSLExporter
+from PySide6.QtGui import QUndoStack
+
+from core.commands import AddItemCommand, BatchCommand
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -30,6 +33,11 @@ class MainWindow(QMainWindow):
         self.project = Project()
         self.current_file_path = None
         self.is_modified = False
+        
+        # Undo Stack
+        self.undo_stack = QUndoStack(self)
+        self.undo_stack.indexChanged.connect(self.on_project_modified)
+
         
         # Central: Simulator
         self.simulator = SimulatorWidget()
@@ -210,7 +218,8 @@ class MainWindow(QMainWindow):
             tracks.sort(key=get_param_index)
             sorted_param_tracks.extend(tracks)
             
-        self.project.tracks = audio_tracks + sorted_param_tracks
+        self.project.tracks.clear()
+        self.project.tracks.extend(audio_tracks + sorted_param_tracks)
 
     def create_automation_track(self, source_name, param_name):
         track_name = f"{source_name}.{param_name}"
@@ -341,12 +350,10 @@ class MainWindow(QMainWindow):
         track.keyframes.append(Keyframe(0.0, current_val)) # Start
         track.keyframes.append(Keyframe(duration, current_val)) # End
         
-        self.project.tracks.append(track)
-        self.sort_tracks() # Sort after adding
+        cmd = AddItemCommand(self.project.tracks, track, f"创建自动化轨道 {track_name}", self, sort_callback=self.sort_tracks)
+        self.undo_stack.push(cmd)
         
         self.statusBar.showMessage(f"已创建轨道: {track_name}", 3000)
-        
-        self.on_project_modified()
         
         if hasattr(self, 'track_window'):
             self.track_window.refresh_tracks()
@@ -364,10 +371,6 @@ class MainWindow(QMainWindow):
                     track = t
                     break
             
-            if not track:
-                track = Track(name=track_name, track_type="param", target_laser=source_name, target_param=param_name)
-                self.project.tracks.append(track)
-            
             min_v = data["min"]
             max_v = data["max"]
             interval = data["interval"]
@@ -383,11 +386,16 @@ class MainWindow(QMainWindow):
                 seq.add_keyframe(current_time, val, curve)
                 current_time += interval
             
-            track.sequences.append(seq)
+            if not track:
+                track = Track(name=track_name, track_type="param", target_laser=source_name, target_param=param_name)
+                track.sequences.append(seq)
+                cmd = AddItemCommand(self.project.tracks, track, f"创建动态随机 {track_name}", self)
+                self.undo_stack.push(cmd)
+            else:
+                cmd = AddItemCommand(track.sequences, seq, f"添加随机片段到 {track_name}", self)
+                self.undo_stack.push(cmd)
                 
             self.statusBar.showMessage(f"已生成随机自动化: {track_name}", 3000)
-            
-            self.on_project_modified()
             
             if hasattr(self, 'track_window'):
                 self.track_window.refresh_tracks()
@@ -415,7 +423,7 @@ class MainWindow(QMainWindow):
         self.dock_timeline = QDockWidget("轨道窗", self)
         self.dock_timeline.setObjectName("dock_timeline")
         self.dock_timeline.setAllowedAreas(Qt.BottomDockWidgetArea)
-        self.track_window = TrackWindow(self.project)
+        self.track_window = TrackWindow(self.project, main_window=self)
         self.track_window.setMinimumHeight(400) # Set initial height to 2x (approx 400px, original likely ~200 default)
         self.dock_timeline.setWidget(self.track_window)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.dock_timeline)
@@ -424,7 +432,7 @@ class MainWindow(QMainWindow):
         self.dock_project_mgr = QDockWidget("工程管理", self)
         self.dock_project_mgr.setObjectName("dock_project_mgr")
         self.dock_project_mgr.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        self.project_panel = ProjectPanel(self.project)
+        self.project_panel = ProjectPanel(self.project, main_window=self)
         self.dock_project_mgr.setWidget(self.project_panel)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.dock_project_mgr)
 
@@ -432,7 +440,7 @@ class MainWindow(QMainWindow):
         self.dock_sources = QDockWidget("光源列表", self)
         self.dock_sources.setObjectName("dock_sources")
         self.dock_sources.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        self.source_panel = SourcePanel(self.project)
+        self.source_panel = SourcePanel(self.project, main_window=self)
         self.dock_sources.setWidget(self.source_panel)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.dock_sources)
         
@@ -440,7 +448,7 @@ class MainWindow(QMainWindow):
         self.dock_props = QDockWidget("属性面板", self)
         self.dock_props.setObjectName("dock_props")
         self.dock_props.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
-        self.props_panel = PropertiesPanel()
+        self.props_panel = PropertiesPanel(main_window=self)
         self.props_panel.set_project(self.project)
         self.dock_props.setWidget(self.props_panel)
         self.addDockWidget(Qt.RightDockWidgetArea, self.dock_props)
@@ -450,6 +458,22 @@ class MainWindow(QMainWindow):
             self.track_window.set_snap_granularity(val)
             self.statusBar.showMessage(f"吸附已设置为: {val}拍", 2000)
 
+    def full_refresh(self):
+        # Notify simulator that data changed
+        if hasattr(self, 'simulator'):
+            self.simulator.on_data_changed()
+            self.reload_shader_with_feedback()
+        
+        # Refresh panels
+        if hasattr(self, 'project_panel'):
+            self.project_panel.set_project(self.project)
+        if hasattr(self, 'source_panel'):
+            self.source_panel.refresh_list()
+        if hasattr(self, 'props_panel'):
+            self.props_panel.refresh_values()
+        if hasattr(self, 'track_window'):
+            self.track_window.refresh_tracks()
+            
     def on_project_modified(self):
         self.is_modified = True
         title = "激光秀设计软件 (Python版)"
@@ -490,6 +514,8 @@ class MainWindow(QMainWindow):
         self.props_panel.set_project(self.project)
         self.props_panel.set_source(None)
         
+        self.undo_stack.clear()
+        
         self.reload_shader_with_feedback()
         self.track_window.refresh_tracks()
         self.source_panel.refresh_list()
@@ -521,6 +547,8 @@ class MainWindow(QMainWindow):
                 self.track_window.set_project(self.project)
                 self.props_panel.set_project(self.project)
                 self.props_panel.set_source(None)
+                
+                self.undo_stack.clear()
                 
                 self.reload_shader_with_feedback()
                 self.track_window.refresh_tracks()
@@ -630,8 +658,18 @@ class MainWindow(QMainWindow):
         
         # Edit
         edit_menu = menu.addMenu("编辑")
-        edit_menu.addAction("撤销")
-        edit_menu.addAction("重做")
+        
+        undo_action = self.undo_stack.createUndoAction(self, "撤销")
+        undo_action.setShortcut(QKeySequence("Ctrl+Z"))
+        edit_menu.addAction(undo_action)
+        
+        redo_action = self.undo_stack.createRedoAction(self, "重做")
+        redo_action.setShortcut(QKeySequence("Ctrl+Y"))
+        # Also support Ctrl+Shift+Z for Redo
+        redo_action_alt = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        redo_action_alt.activated.connect(self.undo_stack.redo)
+        edit_menu.addAction(redo_action)
+        
         edit_menu.addSeparator()
         
         snap_menu = edit_menu.addMenu("轨道吸附颗粒度")

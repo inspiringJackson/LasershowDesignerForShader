@@ -4,10 +4,11 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDoubleValidator, QAction
 from core.models import LaserSource
 from .dialogs import SubordinateSelectionDialog
+from core.commands import PropertyChangeCommand, ListPropertyChangeCommand, BatchCommand
 import math
 
 class ValidatedLineEdit(QLineEdit):
-    value_changed = Signal(float)
+    value_changed = Signal(float, float) # old_val, new_val
     create_automation = Signal(str) # param_name
     create_random = Signal(str) # param_name
 
@@ -37,8 +38,10 @@ class ValidatedLineEdit(QLineEdit):
         try:
             val = float(text)
             if self.min_val <= val <= self.max_val:
-                self.last_valid_value = val
-                self.value_changed.emit(val)
+                if val != self.last_valid_value:
+                    old_val = self.last_valid_value
+                    self.last_valid_value = val
+                    self.value_changed.emit(old_val, val)
             else:
                 # Out of range, revert
                 self.setValue(self.last_valid_value)
@@ -121,8 +124,9 @@ class PropertiesPanel(QWidget):
     request_automation = Signal(str, str) # source_name, param_name
     request_random = Signal(str, str) # source_name, param_name
 
-    def __init__(self, parent=None):
+    def __init__(self, main_window=None, parent=None):
         super().__init__(parent)
+        self.main_window = main_window
         self.current_source = None
         self.project = None
         self.is_updating = False
@@ -246,6 +250,8 @@ class PropertiesPanel(QWidget):
 
     def add_param_row(self, layout, label_text, param_name, min_v, max_v, offset_idx=None):
         input_widget = self.create_input(param_name, min_v, max_v)
+        if offset_idx is not None:
+            input_widget.setProperty("param_idx", offset_idx)
         
         offset_widget = None
         mode_toggle = None
@@ -400,9 +406,13 @@ class PropertiesPanel(QWidget):
 
     def on_master_toggled(self, checked):
         if self.is_updating or not self.current_source: return
-        self.current_source.is_master = checked
-        self.update_master_ui_state()
-        self.source_changed.emit()
+        if self.main_window:
+            cmd = PropertyChangeCommand(self.current_source, "is_master", not checked, checked, "切换主控开关", self.main_window)
+            self.main_window.undo_stack.push(cmd)
+        else:
+            self.current_source.is_master = checked
+            self.update_master_ui_state()
+            self.source_changed.emit()
 
     def update_master_ui_state(self):
         is_master = self.master_switch.isChecked()
@@ -426,8 +436,14 @@ class PropertiesPanel(QWidget):
         offset_idx = sender.property("offset_idx")
         if offset_idx is not None:
             val = 1.0 if checked else 0.0
-            self.current_source.offset_mode_params[offset_idx] = val
-            self.source_changed.emit()
+            old_val = self.current_source.offset_mode_params[offset_idx]
+            if val != old_val:
+                if self.main_window:
+                    cmd = ListPropertyChangeCommand(self.current_source.offset_mode_params, offset_idx, old_val, val, "切换偏移模式", self.main_window)
+                    self.main_window.undo_stack.push(cmd)
+                else:
+                    self.current_source.offset_mode_params[offset_idx] = val
+                    self.source_changed.emit()
 
     def on_select_subordinates(self):
         if not self.current_source or not self.project: return
@@ -455,37 +471,70 @@ class PropertiesPanel(QWidget):
         dialog = SubordinateSelectionDialog(available, current_subs, self)
         if dialog.exec():
             new_subs = dialog.get_selection()
+            if new_subs == current_subs: return
             
-            # Update Logic
-            # 1. Unlink old subordinates that are removed
-            for sub_name in current_subs:
-                if sub_name not in new_subs:
-                    # Find laser object
+            if self.main_window:
+                commands = []
+                # 1. Unlink old
+                for sub_name in current_subs:
+                    if sub_name not in new_subs:
+                        for l in self.project.lasers:
+                            if l.name == sub_name:
+                                commands.append(PropertyChangeCommand(l, "master_id", l.master_id, "", f"解除 {sub_name} 附属", self.main_window))
+                                break
+                # 2. Link new
+                for sub_name in new_subs:
+                    if sub_name not in current_subs:
+                        for l in self.project.lasers:
+                            if l.name == sub_name:
+                                commands.append(PropertyChangeCommand(l, "master_id", l.master_id, self.current_source.name, f"添加 {sub_name} 附属", self.main_window))
+                                break
+                
+                commands.append(PropertyChangeCommand(self.current_source, "subordinate_ids", list(current_subs), list(new_subs), "更新附属列表", self.main_window))
+                batch = BatchCommand(commands, "修改附属光源", self.main_window)
+                self.main_window.undo_stack.push(batch)
+            else:
+                # Update Logic
+                # 1. Unlink old subordinates that are removed
+                for sub_name in current_subs:
+                    if sub_name not in new_subs:
+                        # Find laser object
+                        for l in self.project.lasers:
+                            if l.name == sub_name:
+                                l.master_id = ""
+                                break
+                                
+                # 2. Link new subordinates
+                for sub_name in new_subs:
                     for l in self.project.lasers:
                         if l.name == sub_name:
-                            l.master_id = ""
+                            l.master_id = self.current_source.name
                             break
                             
-            # 2. Link new subordinates
-            for sub_name in new_subs:
-                for l in self.project.lasers:
-                    if l.name == sub_name:
-                        l.master_id = self.current_source.name
-                        break
-                        
-            self.current_source.subordinate_ids = new_subs
-            self.source_changed.emit()
+                self.current_source.subordinate_ids = new_subs
+                self.source_changed.emit()
 
     def on_name_changed(self):
         if self.is_updating or not self.current_source: return
-        self.current_source.name = self.name_edit.text()
-        self.source_changed.emit()
+        new_name = self.name_edit.text()
+        if new_name == self.current_source.name: return
+        if self.main_window:
+            cmd = PropertyChangeCommand(self.current_source, "name", self.current_source.name, new_name, "修改光源名称", self.main_window)
+            self.main_window.undo_stack.push(cmd)
+        else:
+            self.current_source.name = new_name
+            self.source_changed.emit()
 
     def on_type_changed(self, idx):
         if self.is_updating or not self.current_source: return
-        self.current_source.type = idx
-        self.update_param_labels(idx)
-        self.source_changed.emit()
+        if idx == self.current_source.type: return
+        if self.main_window:
+            cmd = PropertyChangeCommand(self.current_source, "type", self.current_source.type, idx, "修改光源类型", self.main_window)
+            self.main_window.undo_stack.push(cmd)
+        else:
+            self.current_source.type = idx
+            self.update_param_labels(idx)
+            self.source_changed.emit()
 
     def update_param_labels(self, idx):
         # Default Labels
@@ -550,58 +599,48 @@ class PropertiesPanel(QWidget):
         if self.current_source:
             self.request_random.emit(self.current_source.name, param_name)
 
-    def on_val_changed(self, val):
+    def on_val_changed(self, old_val, new_val):
         if self.is_updating or not self.current_source: return
         
         sender = self.sender()
         
         # Check if it's an offset input
         offset_idx = sender.property("offset_idx")
+        param_idx = sender.property("param_idx")
+        
         if offset_idx is not None:
-            final_val = val
+            final_new = new_val
+            final_old = old_val
             # Apply conversions matching main params
             if offset_idx in [6, 7, 8]: # Color
-                final_val = self.from_ui_color(val)
+                final_new = self.from_ui_color(new_val)
+                final_old = self.from_ui_color(old_val)
             elif offset_idx == 11: # Divergence
-                final_val = self.from_ui_angle(val)
+                final_new = self.from_ui_angle(new_val)
+                final_old = self.from_ui_angle(old_val)
             
-            self.current_source.offset_params[offset_idx] = final_val
-            self.source_changed.emit()
+            if self.main_window:
+                cmd = ListPropertyChangeCommand(self.current_source.offset_params, offset_idx, final_old, final_new, f"修改 {sender.param_name}", self.main_window)
+                self.main_window.undo_stack.push(cmd)
+            else:
+                self.current_source.offset_params[offset_idx] = final_new
+                self.source_changed.emit()
             return
 
-        # Normal params logic ...
-        p = self.current_source.params
-        p[0] = self.pos_x.value()
-        p[1] = self.pos_y.value()
-        p[2] = self.pos_z.value()
-        
-        p[3] = self.dir_x.value()
-        p[4] = self.dir_y.value()
-        p[5] = self.dir_z.value()
-        
-        p[6] = self.from_ui_color(self.color_r.value())
-        p[7] = self.from_ui_color(self.color_g.value())
-        p[8] = self.from_ui_color(self.color_b.value())
-        
-        p[9] = self.brightness.value()
-        p[10] = self.thickness.value()
-        p[11] = self.from_ui_angle(self.divergence.value())
-        p[12] = self.attenuation.value()
-        
-        px = self.param_x.value()
-        py = self.param_y.value()
-        pz = self.param_z.value()
-        pw = self.param_w.value()
-        
-             
-        p[13] = px
-        p[14] = py
-        p[15] = pz
-        p[16] = pw
-        
-        # Local Up
-        p[17] = self.local_up_x.value()
-        p[18] = self.local_up_y.value()
-        p[19] = self.local_up_z.value()
-        
-        self.source_changed.emit()
+        if param_idx is not None:
+            final_new = new_val
+            final_old = old_val
+            if param_idx in [6, 7, 8]:
+                final_new = self.from_ui_color(new_val)
+                final_old = self.from_ui_color(old_val)
+            elif param_idx == 11:
+                final_new = self.from_ui_angle(new_val)
+                final_old = self.from_ui_angle(old_val)
+                
+            if self.main_window:
+                cmd = ListPropertyChangeCommand(self.current_source.params, param_idx, final_old, final_new, f"修改 {sender.param_name}", self.main_window)
+                self.main_window.undo_stack.push(cmd)
+            else:
+                self.current_source.params[param_idx] = final_new
+                self.source_changed.emit()
+            return

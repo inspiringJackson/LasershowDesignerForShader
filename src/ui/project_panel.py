@@ -1,13 +1,15 @@
 from PySide6.QtWidgets import QWidget, QFormLayout, QDoubleSpinBox, QComboBox, QGroupBox, QVBoxLayout, QSpinBox
 from PySide6.QtCore import Signal
 from core.models import Project
+from core.commands import ProjectSettingsCommand
 
 class ProjectPanel(QWidget):
     settings_changed = Signal()
 
-    def __init__(self, project: Project, parent=None):
+    def __init__(self, project: Project, parent=None, main_window=None):
         super().__init__(parent)
         self.project = project
+        self.main_window = main_window
         self.init_ui()
 
     def init_ui(self):
@@ -41,21 +43,49 @@ class ProjectPanel(QWidget):
         layout.addStretch()
 
     def on_bpm_changed(self, value):
-        self.project.bpm = value
+        if self.project.bpm == value: return
+        if self.main_window:
+            cmd = ProjectSettingsCommand(self.project, "bpm", self.project.bpm, value, "修改 BPM", self.main_window)
+            self.main_window.undo_stack.push(cmd)
+        else:
+            self.project.bpm = value
         self.settings_changed.emit()
 
     def on_ts_changed(self, value):
-        self.project.time_signature = value
-        try:
-            # Parse numerator from "3/4", "6/8" etc.
-            numerator = int(value.split('/')[0])
-            self.project.beats_per_bar = numerator
-        except (ValueError, IndexError):
-            pass
+        if self.project.time_signature == value: return
+        
+        if self.main_window:
+            self.main_window.undo_stack.beginMacro("修改拍号")
+            cmd = ProjectSettingsCommand(self.project, "time_signature", self.project.time_signature, value, "修改拍号", self.main_window)
+            self.main_window.undo_stack.push(cmd)
+            
+            try:
+                # Parse numerator from "3/4", "6/8" etc.
+                numerator = int(value.split('/')[0])
+                if self.project.beats_per_bar != numerator:
+                    cmd2 = ProjectSettingsCommand(self.project, "beats_per_bar", self.project.beats_per_bar, numerator, "修改每小节拍数", self.main_window)
+                    self.main_window.undo_stack.push(cmd2)
+            except (ValueError, IndexError):
+                pass
+            
+            self.main_window.undo_stack.endMacro()
+        else:
+            self.project.time_signature = value
+            try:
+                numerator = int(value.split('/')[0])
+                self.project.beats_per_bar = numerator
+            except (ValueError, IndexError):
+                pass
+                
         self.settings_changed.emit()
 
     def on_len_changed(self, value):
-        self.project.total_measures = value
+        if self.project.total_measures == value: return
+        if self.main_window:
+            cmd = ProjectSettingsCommand(self.project, "total_measures", self.project.total_measures, value, "修改工程长度", self.main_window)
+            self.main_window.undo_stack.push(cmd)
+        else:
+            self.project.total_measures = value
         self.settings_changed.emit()
 
     def set_project(self, project: Project):

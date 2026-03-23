@@ -1129,7 +1129,7 @@ float oscillate(float minVal, float maxVal, float frequency, float time, float p
             current_beat = (self.current_time * bpm) / 60.0
             
             for track in self.project.tracks:
-                if track.track_type == "audio" or not track.target_laser:
+                if track.track_type == "audio" or not track.target_laser or not track.enabled:
                     continue
                 
                 # Resolve Laser Object from Name

@@ -10,6 +10,7 @@ from PySide6.QtGui import (QPainter, QColor, QPen, QBrush, QWheelEvent, QMouseEv
                            QPolygonF)
 
 from core.models import Project, Track, Sequence, Keyframe, CurveType
+from core.commands import PropertyChangeCommand, AddItemCommand, RemoveItemCommand, ReplaceItemCommand, KeyframeMoveCommand, SequenceMoveCommand, SequenceResizeCommand, BatchCommand
 import os
 import wave
 import struct
@@ -55,11 +56,12 @@ class TrackHeaderWidget(QWidget):
     collapse_requested = Signal(str) # Emits laser name
     expand_requested = Signal(str) # Emits laser name
 
-    def __init__(self, track: Track, is_group_header=False, laser_name="", parent=None):
+    def __init__(self, track: Track, is_group_header=False, laser_name="", parent=None, main_window=None):
         super().__init__(parent)
         self.track = track
         self.is_group_header = is_group_header
         self.laser_name = laser_name
+        self.main_window = main_window
         
         self.setFixedHeight(track.height)
         
@@ -172,14 +174,19 @@ class TrackHeaderWidget(QWidget):
 
 
     def toggle_enable(self, checked):
-        self.track.enabled = checked
-        self.btn_enable.setText("On" if checked else "Off")
-        p = self.parent()
-        while p:
-            if isinstance(p, TrackWindow):
-                p.data_changed.emit()
-                break
-            p = p.parent()
+        if self.main_window:
+            from core.commands import PropertyChangeCommand
+            cmd = PropertyChangeCommand(self.track, "enabled", not checked, checked, "切换轨道启用状态", self.main_window)
+            self.main_window.undo_stack.push(cmd)
+        else:
+            self.track.enabled = checked
+            self.btn_enable.setText("On" if checked else "Off")
+            p = self.parent()
+            while p:
+                if isinstance(p, TrackWindow):
+                    p.data_changed.emit()
+                    break
+                p = p.parent()
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -207,38 +214,42 @@ class TrackHeaderWidget(QWidget):
 
     def rename_track(self):
         name, ok = QInputDialog.getText(self, "重命名轨道", "新名称:", text=self.track.name)
-        if ok and name:
-            self.track.name = name
-            self.lbl_name.setText(name)
-            p = self.parent()
-            while p:
-                if isinstance(p, TrackWindow):
-                    p.data_changed.emit()
-                    break
-                p = p.parent()
+        if ok and name and name != self.track.name:
+            if self.main_window:
+                cmd = PropertyChangeCommand(self.track, "name", self.track.name, name, f"重命名轨道 {self.track.name}", self.main_window)
+                self.main_window.undo_stack.push(cmd)
+            else:
+                self.track.name = name
+                self.lbl_name.setText(name)
+                p = self.parent()
+                while p:
+                    if isinstance(p, TrackWindow):
+                        p.data_changed.emit()
+                        break
+                    p = p.parent()
             
     def set_range(self):
         dlg = RangeDialog(self.track.min_val, self.track.max_val, self)
         if dlg.exec():
             min_v, max_v = dlg.get_values()
-            self.track.min_val = min_v
-            self.track.max_val = max_v
-            # Trigger refresh of track window to update view
-            # We need to access parent TrackWindow? 
-            # This widget is in a layout... traversing up is brittle.
-            # But the track object is shared.
-            # The TrackWindow will refresh on scroll/zoom but not automatically on this change unless we signal.
-            # Ideally emit signal.
-            # For now, user might need to scroll or we rely on main window update loop? 
-            # Let's try to find TrackWindow.
-            p = self.parent()
-            while p:
-                if isinstance(p, TrackWindow):
-                    p.refresh_tracks()
-                    if hasattr(p, 'data_changed'):
-                        p.data_changed.emit()
-                    break
-                p = p.parent()
+            if min_v == self.track.min_val and max_v == self.track.max_val: return
+            
+            if self.main_window:
+                cmd1 = PropertyChangeCommand(self.track, "min_val", self.track.min_val, min_v, "修改范围下限", self.main_window)
+                cmd2 = PropertyChangeCommand(self.track, "max_val", self.track.max_val, max_v, "修改范围上限", self.main_window)
+                batch = BatchCommand([cmd1, cmd2], f"修改轨道 {self.track.name} 范围", self.main_window)
+                self.main_window.undo_stack.push(batch)
+            else:
+                self.track.min_val = min_v
+                self.track.max_val = max_v
+                p = self.parent()
+                while p:
+                    if isinstance(p, TrackWindow):
+                        p.refresh_tracks()
+                        if hasattr(p, 'data_changed'):
+                            p.data_changed.emit()
+                        break
+                    p = p.parent()
 
 class RangeDialog(QDialog):
     def __init__(self, min_v, max_v, parent=None):
@@ -306,8 +317,34 @@ class KeyframeItem(QGraphicsItem):
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges)
         self.setAcceptHoverEvents(True)
         
+        self.drag_start_time = keyframe.time
+        self.drag_start_val = keyframe.value
+        
         self.radius = 4
         self.update_pos()
+        
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.drag_start_time = self.keyframe.time
+            self.drag_start_val = self.keyframe.value
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.LeftButton and hasattr(self, 'drag_start_time'):
+            new_time = self.keyframe.time
+            new_val = self.keyframe.value
+            if abs(new_time - self.drag_start_time) > 0.001 or abs(new_val - self.drag_start_val) > 0.001:
+                main_window = None
+                if self.scene() and hasattr(self.scene(), 'main_window'):
+                    main_window = self.scene().main_window
+                if main_window:
+                    self.keyframe.time = self.drag_start_time
+                    self.keyframe.value = self.drag_start_val
+                    cmd = KeyframeMoveCommand(self.keyframe, self.drag_start_time, self.drag_start_val, new_time, new_val, "移动关键帧", main_window)
+                    main_window.undo_stack.push(cmd)
+            self.drag_start_time = self.keyframe.time
+            self.drag_start_val = self.keyframe.value
         
     def boundingRect(self):
         # Slightly larger rect for better hit testing
@@ -448,11 +485,16 @@ class KeyframeItem(QGraphicsItem):
                 act.setCheckable(True)
                 act.setChecked(prev_kf.curve_type == ctype)
                 def set_curve():
-                    prev_kf.curve_type = ctype
-                    if self.parentItem() and hasattr(self.parentItem(), 'update_curve'):
-                         self.parentItem().update_curve()
-                    if self.scene() and hasattr(self.scene(), 'data_changed'):
-                        self.scene().data_changed.emit()
+                    if view and hasattr(view.scene(), 'main_window') and view.scene().main_window:
+                        main_window = view.scene().main_window
+                        cmd = PropertyChangeCommand(prev_kf, "curve_type", prev_kf.curve_type, ctype, "修改曲线类型", main_window)
+                        main_window.undo_stack.push(cmd)
+                    else:
+                        prev_kf.curve_type = ctype
+                        if self.parentItem() and hasattr(self.parentItem(), 'update_curve'):
+                             self.parentItem().update_curve()
+                        if self.scene() and hasattr(self.scene(), 'data_changed'):
+                            self.scene().data_changed.emit()
                 act.triggered.connect(set_curve)
                 
             add_curve_action("平滑 Smooth", CurveType.SMOOTH)
@@ -494,14 +536,18 @@ class KeyframeItem(QGraphicsItem):
         dlg = StyledInputDialog("输入值", "参数值:", self.keyframe.value, self.track.min_val, self.track.max_val, 4, parent=view)
         if dlg.exec():
             val = dlg.get_value()
-            self.keyframe.value = val
-            self.update_pos()
-            if self.parentItem() and hasattr(self.parentItem(), 'update_curve'):
-                self.parentItem().update_curve()
-            if self.scene() and hasattr(self.scene(), 'data_changed'):
-                self.scene().data_changed.emit()
-            if self.scene() and hasattr(self.scene(), 'data_changed'):
-                self.scene().data_changed.emit()
+            if val == self.keyframe.value: return
+            main_window = view.scene().main_window if view and hasattr(view.scene(), 'main_window') else None
+            if main_window:
+                cmd = PropertyChangeCommand(self.keyframe, "value", self.keyframe.value, val, "输入关键帧值", main_window)
+                main_window.undo_stack.push(cmd)
+            else:
+                self.keyframe.value = val
+                self.update_pos()
+                if self.parentItem() and hasattr(self.parentItem(), 'update_curve'):
+                    self.parentItem().update_curve()
+                if self.scene() and hasattr(self.scene(), 'data_changed'):
+                    self.scene().data_changed.emit()
 
     def mouseDoubleClickEvent(self, event):
         self.input_value()
@@ -515,10 +561,17 @@ class KeyframeItem(QGraphicsItem):
         try:
             val = float(text)
             val = max(self.track.min_val, min(self.track.max_val, val))
-            self.keyframe.value = val
-            self.update_pos()
-            if self.parentItem() and hasattr(self.parentItem(), 'update_curve'):
-                self.parentItem().update_curve()
+            if val == self.keyframe.value: return
+            
+            main_window = self.scene().main_window if self.scene() and hasattr(self.scene(), 'main_window') else None
+            if main_window:
+                cmd = PropertyChangeCommand(self.keyframe, "value", self.keyframe.value, val, "粘贴关键帧值", main_window)
+                main_window.undo_stack.push(cmd)
+            else:
+                self.keyframe.value = val
+                self.update_pos()
+                if self.parentItem() and hasattr(self.parentItem(), 'update_curve'):
+                    self.parentItem().update_curve()
         except ValueError:
             pass
 
@@ -527,30 +580,43 @@ class KeyframeItem(QGraphicsItem):
         if self.keyframe in self.track.keyframes:
             idx = self.track.keyframes.index(self.keyframe)
             
-            # Transfer curve properties to previous keyframe if applicable
-            if idx > 0 and idx < len(self.track.keyframes) - 1:
-                prev_kf = self.track.keyframes[idx-1]
-                prev_kf.curve_type = self.keyframe.curve_type
-                prev_kf.tension = self.keyframe.tension
-
-            self.track.keyframes.remove(self.keyframe)
+            main_window = self.scene().main_window if self.scene() and hasattr(self.scene(), 'main_window') else None
             
-            # Capture parent before removing from scene to ensure update_curve works
-            parent = self.parentItem()
-            
-            if self.scene():
-                self.scene().removeItem(self)
-                if hasattr(self.scene(), 'data_changed'):
-                    self.scene().data_changed.emit()
+            if main_window:
+                commands = []
+                if idx > 0 and idx < len(self.track.keyframes) - 1:
+                    prev_kf = self.track.keyframes[idx-1]
+                    commands.append(PropertyChangeCommand(prev_kf, "curve_type", prev_kf.curve_type, self.keyframe.curve_type, "", main_window))
+                    commands.append(PropertyChangeCommand(prev_kf, "tension", prev_kf.tension, self.keyframe.tension, "", main_window))
                 
-            # Force full curve update
-            if parent and hasattr(parent, 'update_curve'):
-                parent.update_curve()
+                commands.append(RemoveItemCommand(self.track.keyframes, idx, self.keyframe, "删除关键帧", main_window))
+                batch = BatchCommand(commands, "删除关键帧", main_window)
+                main_window.undo_stack.push(batch)
+            else:
+                # Transfer curve properties to previous keyframe if applicable
+                if idx > 0 and idx < len(self.track.keyframes) - 1:
+                    prev_kf = self.track.keyframes[idx-1]
+                    prev_kf.curve_type = self.keyframe.curve_type
+                    prev_kf.tension = self.keyframe.tension
+    
+                self.track.keyframes.remove(self.keyframe)
                 
-            # Remove from parent's list if possible (cleanup)
-            if parent and hasattr(parent, 'keyframe_items'):
-                if self in parent.keyframe_items:
-                    parent.keyframe_items.remove(self)
+                # Capture parent before removing from scene to ensure update_curve works
+                parent = self.parentItem()
+                
+                if self.scene():
+                    self.scene().removeItem(self)
+                    if hasattr(self.scene(), 'data_changed'):
+                        self.scene().data_changed.emit()
+                    
+                # Force full curve update
+                if parent and hasattr(parent, 'update_curve'):
+                    parent.update_curve()
+                    
+                # Remove from parent's list if possible (cleanup)
+                if parent and hasattr(parent, 'keyframe_items'):
+                    if self in parent.keyframe_items:
+                        parent.keyframe_items.remove(self)
 
 class TensionHandleItem(QGraphicsItem):
     """Handle for adjusting tension between two keyframes"""
@@ -614,12 +680,18 @@ class TensionHandleItem(QGraphicsItem):
         dlg = StyledInputDialog("输入张力值", "张力 (-1.0 ~ 1.0):", self.keyframe.tension, -1.0, 1.0, 4, parent=view)
         if dlg.exec():
             val = dlg.get_value()
-            self.keyframe.tension = val
-            self.update_pos_from_tension()
-            if self.parentItem() and hasattr(self.parentItem(), 'update_curve'):
-                self.parentItem().update_curve()
-            if self.scene() and hasattr(self.scene(), 'data_changed'):
-                self.scene().data_changed.emit()
+            if val == self.keyframe.tension: return
+            main_window = self.scene().main_window if self.scene() and hasattr(self.scene(), 'main_window') else None
+            if main_window:
+                cmd = PropertyChangeCommand(self.keyframe, "tension", self.keyframe.tension, val, "输入张力值", main_window)
+                main_window.undo_stack.push(cmd)
+            else:
+                self.keyframe.tension = val
+                self.update_pos_from_tension()
+                if self.parentItem() and hasattr(self.parentItem(), 'update_curve'):
+                    self.parentItem().update_curve()
+                if self.scene() and hasattr(self.scene(), 'data_changed'):
+                    self.scene().data_changed.emit()
 
     def mouseDoubleClickEvent(self, event):
         self.input_value()
@@ -633,10 +705,16 @@ class TensionHandleItem(QGraphicsItem):
         try:
             val = float(text)
             val = max(-1.0, min(1.0, val)) # Clamp to valid range
-            self.keyframe.tension = val
-            self.update_pos_from_tension()
-            if self.parentItem() and hasattr(self.parentItem(), 'update_curve'):
-                self.parentItem().update_curve()
+            if val == self.keyframe.tension: return
+            main_window = self.scene().main_window if self.scene() and hasattr(self.scene(), 'main_window') else None
+            if main_window:
+                cmd = PropertyChangeCommand(self.keyframe, "tension", self.keyframe.tension, val, "粘贴张力值", main_window)
+                main_window.undo_stack.push(cmd)
+            else:
+                self.keyframe.tension = val
+                self.update_pos_from_tension()
+                if self.parentItem() and hasattr(self.parentItem(), 'update_curve'):
+                    self.parentItem().update_curve()
         except ValueError:
             pass
 
@@ -683,6 +761,15 @@ class TensionHandleItem(QGraphicsItem):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.is_dragging = False
+            
+            main_window = self.scene().main_window if self.scene() and hasattr(self.scene(), 'main_window') else None
+            if main_window and hasattr(self, 'start_tension'):
+                new_tension = self.keyframe.tension
+                if abs(new_tension - self.start_tension) > 0.001:
+                    self.keyframe.tension = self.start_tension
+                    cmd = PropertyChangeCommand(self.keyframe, "tension", self.start_tension, new_tension, "调整张力", main_window)
+                    main_window.undo_stack.push(cmd)
+            
             event.accept()
         else:
             super().mouseReleaseEvent(event)
@@ -822,6 +909,28 @@ class ResizeHandle(QGraphicsRectItem):
         self.parent_item.update_geometry()
         event.accept()
 
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        
+        main_window = None
+        if self.parent_item and self.parent_item.scene() and hasattr(self.parent_item.scene(), 'main_window'):
+            main_window = self.parent_item.scene().main_window
+            
+        if main_window and hasattr(self, 'start_seq_start'):
+            new_start = self.parent_item.sequence.start_time
+            new_dur = self.parent_item.sequence.duration
+            new_offset = self.parent_item.sequence.audio_offset
+            
+            if abs(new_start - self.start_seq_start) > 0.001 or abs(new_dur - self.start_seq_dur) > 0.001 or abs(new_offset - self.start_seq_offset) > 0.001:
+                # Restore old and push command
+                self.parent_item.sequence.start_time = self.start_seq_start
+                self.parent_item.sequence.duration = self.start_seq_dur
+                self.parent_item.sequence.audio_offset = self.start_seq_offset
+                
+                cmd = SequenceResizeCommand(self.parent_item.sequence, self.start_seq_start, self.start_seq_dur, self.start_seq_offset, 
+                                          new_start, new_dur, new_offset, "缩放片段", main_window)
+                main_window.undo_stack.push(cmd)
+
 class BaseSequenceItem(QGraphicsRectItem):
     """Base class for sequence items with shared logic"""
     def __init__(self, sequence: Sequence, track_height, pixels_per_beat, parent=None):
@@ -834,6 +943,29 @@ class BaseSequenceItem(QGraphicsRectItem):
         self.setFlag(QGraphicsItem.ItemIsMovable)
         self.setFlag(QGraphicsItem.ItemIsSelectable)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges)
+        
+        self.drag_start_time = sequence.start_time
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.drag_start_time = self.sequence.start_time
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.LeftButton and hasattr(self, 'drag_start_time'):
+            new_start = self.sequence.start_time
+            if abs(new_start - self.drag_start_time) > 0.001:
+                # Find main_window
+                main_window = None
+                if self.scene() and hasattr(self.scene(), 'main_window'):
+                    main_window = self.scene().main_window
+                if main_window:
+                    # Restore old and push command
+                    self.sequence.start_time = self.drag_start_time
+                    cmd = SequenceMoveCommand(self.sequence, self.drag_start_time, new_start, "移动片段", main_window)
+                    main_window.undo_stack.push(cmd)
+            self.drag_start_time = self.sequence.start_time
         
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionChange and self.scene():
@@ -1498,12 +1630,18 @@ class TrackLaneItem(QGraphicsRectItem):
                 val = self.track.min_val + (normalized * r)
                 
                 kf = Keyframe(time, val)
-                self.track.keyframes.insert(insert_idx, kf)
                 
-                KeyframeItem(kf, self.track, self.pixels_per_beat, self)
-                self.update_curve()
-                if self.scene() and hasattr(self.scene(), 'data_changed'):
-                    self.scene().data_changed.emit()
+                main_window = self.scene().main_window if self.scene() and hasattr(self.scene(), 'main_window') else None
+                if main_window:
+                    from core.commands import InsertItemCommand
+                    cmd = InsertItemCommand(self.track.keyframes, insert_idx, kf, "添加关键帧", main_window)
+                    main_window.undo_stack.push(cmd)
+                else:
+                    self.track.keyframes.insert(insert_idx, kf)
+                    KeyframeItem(kf, self.track, self.pixels_per_beat, self)
+                    self.update_curve()
+                    if self.scene() and hasattr(self.scene(), 'data_changed'):
+                        self.scene().data_changed.emit()
                 event.accept()
                 return
                 
@@ -1547,9 +1685,10 @@ class PlayheadItem(QGraphicsLineItem):
 class TimelineScene(QGraphicsScene):
     data_changed = Signal()
 
-    def __init__(self, project: Project, parent=None):
+    def __init__(self, project: Project, parent=None, main_window=None):
         super().__init__(parent)
         self.project = project
+        self.main_window = main_window
         self.pixels_per_beat = 40.0
         self.total_beats = 1000 
         self.snap_granularity = 1.0
@@ -1648,9 +1787,10 @@ class TimelineScene(QGraphicsScene):
 class AudioTimelineScene(QGraphicsScene):
     data_changed = Signal()
 
-    def __init__(self, project: Project, parent=None):
+    def __init__(self, project: Project, parent=None, main_window=None):
         super().__init__(parent)
         self.project = project
+        self.main_window = main_window
         self.pixels_per_beat = 40.0
         self.total_beats = 1000
         self.snap_granularity = 1.0
@@ -1804,9 +1944,10 @@ class TrackWindow(QWidget):
     track_deleted = Signal(str) # Emits track name
     data_changed = Signal()
 
-    def __init__(self, project: Project, parent=None):
+    def __init__(self, project: Project, parent=None, main_window=None):
         super().__init__(parent)
         self.project = project
+        self.main_window = main_window
         self.pixels_per_beat = 40.0
         self.snap_granularity = 1.0 # Default 1 beat
         self.setAcceptDrops(True)
@@ -1927,7 +2068,7 @@ class TrackWindow(QWidget):
         right_layout.setSpacing(0)
         
         self.audio_view = QGraphicsView()
-        self.audio_scene = AudioTimelineScene(self.project)
+        self.audio_scene = AudioTimelineScene(self.project, main_window=self.main_window)
         self.audio_scene.data_changed.connect(self.data_changed)
         self.audio_view.setScene(self.audio_scene)
         self.audio_view.setAlignment(Qt.AlignLeft | Qt.AlignTop)
@@ -1938,7 +2079,7 @@ class TrackWindow(QWidget):
         right_layout.addWidget(self.audio_view)
         
         self.timeline_view = QGraphicsView()
-        self.timeline_scene = TimelineScene(self.project)
+        self.timeline_scene = TimelineScene(self.project, main_window=self.main_window)
         self.timeline_scene.data_changed.connect(self.data_changed)
         self.timeline_view.setScene(self.timeline_scene)
         self.timeline_view.setAlignment(Qt.AlignLeft | Qt.AlignTop)
@@ -2031,7 +2172,7 @@ class TrackWindow(QWidget):
         
         for track in self.project.tracks:
             if track.track_type == "audio":
-                hw = TrackHeaderWidget(track)
+                hw = TrackHeaderWidget(track, main_window=self.main_window)
                 hw.delete_requested.connect(lambda t=track: self.delete_track(t))
                 self.audio_header_layout.addWidget(hw)
                 audio_height += track.height
@@ -2043,13 +2184,13 @@ class TrackWindow(QWidget):
                         # Create a dummy track object or just pass None and use special mode
                         # But TrackHeaderWidget expects a track for height.
                         # Use current track for height ref?
-                        hw = TrackHeaderWidget(track, is_group_header=True, laser_name=laser_name)
+                        hw = TrackHeaderWidget(track, is_group_header=True, laser_name=laser_name, main_window=self.main_window)
                         hw.expand_requested.connect(self.expand_group)
                         self.track_header_layout.insertWidget(self.track_header_layout.count()-1, hw)
                         rendered_groups.add(laser_name)
                 else:
                     # Normal
-                    hw = TrackHeaderWidget(track)
+                    hw = TrackHeaderWidget(track, main_window=self.main_window)
                     hw.delete_requested.connect(lambda t=track: self.delete_track(t))
                     hw.collapse_requested.connect(self.collapse_group)
                     self.track_header_layout.insertWidget(self.track_header_layout.count()-1, hw)
@@ -2073,20 +2214,41 @@ class TrackWindow(QWidget):
              self.corner_widget.setFixedWidth(self.splitter.sizes()[0])
 
     def collapse_group(self, laser_name):
+        if self.main_window:
+            from core.commands import SetPropertyCommand
+            cmd = SetPropertyCommand(self, "folded_groups", "add_folded_group", "remove_folded_group", laser_name, f"折叠轨道组 {laser_name}", self.main_window)
+            self.main_window.undo_stack.push(cmd)
+        else:
+            self.add_folded_group(laser_name)
+            
+    def expand_group(self, laser_name):
+        if self.main_window:
+            from core.commands import SetPropertyCommand
+            cmd = SetPropertyCommand(self, "folded_groups", "remove_folded_group", "add_folded_group", laser_name, f"展开轨道组 {laser_name}", self.main_window)
+            self.main_window.undo_stack.push(cmd)
+        else:
+            self.remove_folded_group(laser_name)
+
+    def add_folded_group(self, laser_name):
         self.folded_groups.add(laser_name)
         self.refresh_tracks()
         
-    def expand_group(self, laser_name):
+    def remove_folded_group(self, laser_name):
         if laser_name in self.folded_groups:
             self.folded_groups.remove(laser_name)
             self.refresh_tracks()
 
     def delete_track(self, track):
         if track in self.project.tracks:
-            self.project.tracks.remove(track)
-            self.track_deleted.emit(track.name)
-            self.data_changed.emit()
-            self.refresh_tracks()
+            idx = self.project.tracks.index(track)
+            if self.main_window:
+                cmd = RemoveItemCommand(self.project.tracks, idx, track, f"删除轨道 {track.name}", self.main_window)
+                self.main_window.undo_stack.push(cmd)
+            else:
+                self.project.tracks.remove(track)
+                self.track_deleted.emit(track.name)
+                self.data_changed.emit()
+                self.refresh_tracks()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -2113,11 +2275,6 @@ class TrackWindow(QWidget):
                 audio_track = t
                 break
         
-        if not audio_track:
-            # Use default track height (120) instead of hardcoded 60
-            audio_track = Track(name="Audio", track_type="audio", height=120)
-            self.project.tracks.insert(0, audio_track)
-            
         # Calculate duration in beats
         duration_beats = 100.0 # Fallback
         try:
@@ -2127,15 +2284,28 @@ class TrackWindow(QWidget):
                 duration_sec = frames / rate
                 duration_beats = (duration_sec * self.project.bpm) / 60.0
         except Exception:
-            # Fallback for non-wav files or errors
             pass
             
         seq = Sequence(start_time=0, duration=duration_beats, audio_file=file_path) 
-        audio_track.sequences.append(seq)
         
-        self.refresh_tracks()
-        self.audio_added.emit(file_path)
-        self.data_changed.emit()
+        if self.main_window:
+            commands = []
+            if not audio_track:
+                audio_track = Track(name="Audio", track_type="audio", height=120)
+                from core.commands import InsertItemCommand
+                commands.append(InsertItemCommand(self.project.tracks, 0, audio_track, "添加音频轨道", self.main_window))
+            commands.append(AddItemCommand(audio_track.sequences, seq, "添加音频片段", self.main_window))
+            batch = BatchCommand(commands, "导入音频", self.main_window)
+            self.main_window.undo_stack.push(batch)
+            self.audio_added.emit(file_path)
+        else:
+            if not audio_track:
+                audio_track = Track(name="Audio", track_type="audio", height=120)
+                self.project.tracks.insert(0, audio_track)
+            audio_track.sequences.append(seq)
+            self.refresh_tracks()
+            self.audio_added.emit(file_path)
+            self.data_changed.emit()
 
     def eventFilter(self, source, event):
         if event.type() == QEvent.Wheel:
