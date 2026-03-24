@@ -23,7 +23,7 @@ from core.commands import AddItemCommand, BatchCommand
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("激光秀设计软件 (Python版)")
+        self.setWindowTitle("激光秀设计软件")
         self.resize(1600, 900)
         
         # Load Stylesheet
@@ -476,7 +476,7 @@ class MainWindow(QMainWindow):
             
     def on_project_modified(self):
         self.is_modified = True
-        title = "激光秀设计软件 (Python版)"
+        title = "激光秀设计软件"
         if self.current_file_path:
             title += f" - {os.path.basename(self.current_file_path)}"
         else:
@@ -505,7 +505,7 @@ class MainWindow(QMainWindow):
         self.project = Project()
         self.current_file_path = None
         self.is_modified = False
-        self.setWindowTitle("激光秀设计软件 (Python版)")
+        self.setWindowTitle("激光秀设计软件")
         
         self.simulator.set_project(self.project)
         self.project_panel.set_project(self.project)
@@ -539,7 +539,7 @@ class MainWindow(QMainWindow):
                 self.project = new_project
                 self.current_file_path = file_path
                 self.is_modified = False
-                self.setWindowTitle(f"激光秀设计软件 (Python版) - {os.path.basename(file_path)}")
+                self.setWindowTitle(f"激光秀设计软件 - {os.path.basename(file_path)}")
                 
                 self.simulator.set_project(self.project)
                 self.project_panel.set_project(self.project)
@@ -573,7 +573,7 @@ class MainWindow(QMainWindow):
                 json.dump(data, f, indent=4)
                 
             self.is_modified = False
-            self.setWindowTitle(f"激光秀设计软件 (Python版) - {os.path.basename(self.current_file_path)}")
+            self.setWindowTitle(f"激光秀设计软件 - {os.path.basename(self.current_file_path)}")
             self.statusBar.showMessage(f"工程已保存: {self.current_file_path}", 3000)
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"无法保存工程文件:\n{e}")

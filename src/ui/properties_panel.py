@@ -98,8 +98,8 @@ class ValidatedLineEdit(QLineEdit):
         act_auto = menu.addAction("创建自动化轨道包络")
         act_auto.triggered.connect(lambda: self.create_automation.emit(self.param_name))
         
-        act_rand = menu.addAction("动态随机")
-        act_rand.triggered.connect(lambda: self.create_random.emit(self.param_name))
+        # act_rand = menu.addAction("动态随机")
+        # act_rand.triggered.connect(lambda: self.create_random.emit(self.param_name))
         
         menu.exec(event.globalPos())
 
@@ -316,7 +316,7 @@ class PropertiesPanel(QWidget):
         self.form_common.addRow("名称:", self.name_edit)
         
         self.type_combo = ContextComboBox("type")
-        self.type_combo.addItems(["0: Single Beam", "1: Fan", "2: Pattern", "3: Particle", "4: Solid Fan"])
+        self.type_combo.addItems(["0: 光束(Single Beam)", "1: 扇形(Fan)", "2: 图案(Pattern)", "3: 粒子(Particle)", "4: 实扇形(Solid Fan)"])
         self.type_combo.currentIndexChanged.connect(self.on_type_changed)
         self.type_combo.create_automation.connect(self.on_create_automation)
         self.form_common.addRow("类型:", self.type_combo)
