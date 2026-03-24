@@ -6,7 +6,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QPalette, QColor
+from PySide6.QtGui import QPalette, QColor, QIcon
 from PySide6.QtCore import Qt
 from ui.main_window import MainWindow
 import pygame
@@ -20,6 +20,22 @@ def main():
         print(f"Audio init failed: {e}")
     
     app = QApplication(sys.argv)
+    
+    # Set Windows Taskbar Icon properly
+    if os.name == 'nt':
+        import ctypes
+        try:
+            myappid = 'lasershowdesigner.app.1.0'
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception:
+            pass
+
+    icon_path = os.path.join(current_dir, "resources", "logo.png")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+    else:
+        print(f"Icon not found at: {icon_path}")
+    
     
     # Set dark theme palette (Optional, but matches the style)
     palette = QPalette()
