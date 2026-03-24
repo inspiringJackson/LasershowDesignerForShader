@@ -23,7 +23,7 @@ from core.commands import AddItemCommand, BatchCommand
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("激光秀设计软件")
+        self.setWindowTitle("激光秀设计软件 v1.0.0")
         self.resize(1600, 900)
         
         # Load Stylesheet

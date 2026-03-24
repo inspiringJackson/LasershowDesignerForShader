@@ -21,7 +21,7 @@ def generate_laser_color(name):
     if not name:
         return QColor("#2b2b2b")
     # Use MD5 to get a deterministic hash
-    hash_val = int(hashlib.md5(name.encode('utf-8')).hexdigest(), 16)
+    hash_val = int(hashlib.md5(name.encode('utf-8'), usedforsecurity=False).hexdigest(), 16)
     hue = (hash_val % 360) / 360.0
     # Dark theme: Low Value (0.15-0.25), Moderate Saturation (0.3-0.5)
     # To make it distinct but dark.

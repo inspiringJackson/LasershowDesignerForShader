@@ -7,7 +7,20 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+venv/
+env/
+.env/
+.pytest_cache/
 
 # IDE
 .idea/
 .vscode/
+
+# Build & Release Artifacts
+build/
+dist/
+release/
+*.spec
+test_report.xml
+bandit_report.json
+*.sha256
