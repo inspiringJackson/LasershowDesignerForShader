@@ -19,6 +19,7 @@ from core.exporter import GLSLExporter
 from PySide6.QtGui import QUndoStack
 
 from core.commands import AddItemCommand, BatchCommand
+from .agent_panel import AgentPanel
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -452,6 +453,14 @@ class MainWindow(QMainWindow):
         self.props_panel.set_project(self.project)
         self.dock_props.setWidget(self.props_panel)
         self.addDockWidget(Qt.RightDockWidgetArea, self.dock_props)
+
+        # Agent Chat (Right, below Properties)
+        self.dock_agent = QDockWidget("AI 助手", self)
+        self.dock_agent.setObjectName("dock_agent")
+        self.dock_agent.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
+        self.agent_panel = AgentPanel(main_window=self)
+        self.dock_agent.setWidget(self.agent_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.dock_agent)
 
     def set_snap(self, val):
         if hasattr(self, 'track_window'):
